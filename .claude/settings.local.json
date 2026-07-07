@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:aaronw.selfhost.imbue.com)",
+      "Bash(docker version *)",
+      "Bash(podman --version)",
+      "WebFetch(domain:pkgs.alpinelinux.org)"
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+[app]
+name = "fitpub"
+version = "0.1.0"
+description = "FitPub (self-hosted fitness tracking for the Fediverse) packaged for OpenHost. Bundles PostgreSQL/PostGIS and MailPit inside the container; a gate-proxy keeps /admin, /actuator and the MailPit inbox owner-only while leaving the web UI and ActivityPub federation endpoints public."
+
+[runtime.container]
+image = "Dockerfile"
+# Gate-proxy port. FitPub itself runs on 127.0.0.1:8081, PostgreSQL on
+# 127.0.0.1:5432, MailPit on 127.0.0.1:1025 (SMTP) / 8025 (UI) — all
+# loopback-only; the proxy on 8080 is the single routed entrypoint.
+port = 8080
+
+[routing]
+# The proxy answers /healthz itself by probing FitPub's Basic-Auth'd
+# /actuator/health with the generated credentials, so the router can
+# probe readiness without knowing any secrets.
+health_check = "/healthz"
+# Hybrid exposure: every path is public at the router so that
+#   * remote fediverse servers can reach webfinger / nodeinfo /
+#     actors / inboxes unauthenticated (federation requires it), and
+#   * regular visitors can browse timelines and register accounts
+#     using FitPub's own JWT auth.
+# Owner-only surfaces (/admin, /actuator, /mailpit) are enforced by
+# auth_proxy.py inside the container via the X-OpenHost-Is-Owner
+# header the router stamps on authenticated owner requests.
+# public_paths entries are PREFIXES, so "/" covers everything.
+public_paths = ["/"]
+
+[resources]
+# JVM (Spring Boot, capped at 50% of container RAM) + PostgreSQL +
+# MailPit + the Python proxy. 2 GiB gives the JVM ~1 GiB heap and
+# leaves comfortable room for Postgres shared buffers and page cache.
+memory_mb = 2048
+cpu_cores = 1.0
+
+[data]
+# Persistent state under $OPENHOST_APP_DATA_DIR (backed up):
+#   postgres/     — PostgreSQL data directory (PGDATA)
+#   uploads/      — user activity files and avatars
+#   images/       — generated activity images
+#   logs/         — application logs (symlinked from /app/logs)
+#   mailpit/      — MailPit mail store (registration codes live here)
+#   secrets.env   — generated DB/JWT/email/actuator secrets (mode 0600)
+#   config.env    — optional operator overrides, sourced at boot
+app_data = true
+# Recreatable caches under $OPENHOST_APP_TEMP_DIR (not backed up):
+#   tiles/        — rendered map tile cache
+app_temp_data = true
