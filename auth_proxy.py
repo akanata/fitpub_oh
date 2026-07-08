@@ -278,6 +278,38 @@ class GateProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.debug("client disconnected during healthz: %s", exc)
 
+    STARTING_HTML = (
+        b"<!DOCTYPE html><html><head><title>FitPub is starting"
+        b"&hellip;</title><meta http-equiv=\"refresh\" content=\"10\">"
+        b"<style>body{font-family:sans-serif;display:flex;align-items:center;"
+        b"justify-content:center;height:100vh;margin:0}div{text-align:center}"
+        b"</style></head><body><div><h1>FitPub is starting&hellip;</h1>"
+        b"<p>Database migrations can take a few minutes after an update."
+        b"<br>This page refreshes automatically.</p></div></body></html>"
+    )
+
+    def _send_starting_page(self) -> None:
+        wants_html = "text/html" in self.headers.get("Accept", "").lower()
+        body = (
+            self.STARTING_HTML
+            if wants_html
+            else b'{"status":"starting","retry_after":10}'
+        )
+        try:
+            self.send_response(503, "Service Starting")
+            self.send_header(
+                "Content-Type",
+                "text/html; charset=utf-8" if wants_html else "application/json",
+            )
+            self.send_header("Retry-After", "10")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except OSError as exc:
+            log.debug("client disconnected during starting page: %s", exc)
+
     # -------------------------------------------------------------
     # Forwarded-header hygiene
     # -------------------------------------------------------------
@@ -530,6 +562,13 @@ class GateProxyHandler(BaseHTTPRequestHandler):
                     conn.putheader("Content-Length", str(len(body)))
                 conn.endheaders(message_body=body)
                 upstream_resp = conn.getresponse()
+            except ConnectionRefusedError:
+                # FitPub's JVM isn't listening yet — the first boot
+                # after an image update runs Flyway migrations for
+                # several minutes. Tell humans and machines to retry
+                # rather than presenting a dead-looking 502.
+                self._send_starting_page()
+                return
             except (OSError, http.client.HTTPException) as exc:
                 log.warning("upstream error: %s", exc)
                 self._safe_send_error(502, "Bad Gateway")
