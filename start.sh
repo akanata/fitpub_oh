@@ -92,6 +92,9 @@ FITPUB_MAIL_FROM_NAME="FitPub"
 # owner registering with this address gets the bootstrap admin role.
 FITPUB_ADMIN_EMAILS="admin@$FITPUB_DOMAIN"
 FITPUB_ACTUATOR_USERNAME="actuator"
+# Backfill missing remote-activity details on startup. Cheap on a
+# personal instance and repairs gaps after federation outages.
+FITPUB_REMOTE_ACTIVITY_BACKFILL="${FITPUB_REMOTE_ACTIVITY_BACKFILL:-true}"
 
 # Operator overrides — external SMTP, extra admin emails, invite
 # password, feature flags... Anything exported here beats the
@@ -107,18 +110,35 @@ fi
 export FITPUB_DOMAIN FITPUB_BASE_URL FITPUB_MAIL_FROM_ADDRESS \
        FITPUB_MAIL_FROM_NAME FITPUB_ADMIN_EMAILS FITPUB_ACTUATOR_USERNAME \
        FITPUB_DATABASE_PASSWORD FITPUB_JWT_SECRET FITPUB_EMAIL_SECRET \
-       FITPUB_ACTUATOR_PASSWORD
+       FITPUB_ACTUATOR_PASSWORD FITPUB_REMOTE_ACTIVITY_BACKFILL
+ADMIN_EMAILS_DEFAULT="admin@$FITPUB_DOMAIN"
 
 # -----------------------------------------------------------------
 # PostgreSQL + PostGIS
 # -----------------------------------------------------------------
 
-PG_BIN="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+# Alpine puts the server binaries in /usr/libexec/postgresqlNN (with
+# /usr/bin symlinks), Debian/Ubuntu in /usr/lib/postgresql/NN/bin.
+PG_BIN="$( (ls -d /usr/libexec/postgresql*/ /usr/lib/postgresql/*/bin/ 2>/dev/null || true) | sort -V | tail -1 )"
+PG_BIN="${PG_BIN%/}"
+if [[ -z "$PG_BIN" || ! -x "$PG_BIN/initdb" ]]; then
+    PG_BIN="$(dirname "$(command -v initdb)")"
+fi
+log "Using PostgreSQL binaries from $PG_BIN"
+
 # /run is a tmpfs under podman; recreate the socket dir every boot.
 mkdir -p /var/run/postgresql
 chown postgres:postgres /var/run/postgresql
 
-as_postgres() { setpriv --reuid=postgres --regid=postgres --clear-groups "$@"; }
+# Privilege-drop helper: su-exec (Alpine base) or setpriv (util-linux,
+# Ubuntu base). su-exec first — BusyBox ships a limited setpriv
+# without --reuid that would otherwise win the lookup.
+if command -v su-exec >/dev/null; then
+    run_as() { local u="$1"; shift; su-exec "$u" "$@"; }
+else
+    run_as() { local u="$1"; shift; setpriv --reuid="$u" --regid="$u" --clear-groups "$@"; }
+fi
+as_postgres() { run_as postgres "$@"; }
 
 if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
     log "First boot: initializing PostgreSQL cluster in $PGDATA"
@@ -168,12 +188,33 @@ EOF
 as_postgres "$PG_BIN/psql" -v ON_ERROR_STOP=1 -q -d fitpub \
     -c "CREATE EXTENSION IF NOT EXISTS postgis;"
 
+# Single-owner admin bootstrap: FitPub grants the admin role to
+# accounts whose email is listed in FITPUB_ADMIN_EMAILS. The zone
+# owner may already have registered with an arbitrary address, so if
+# the operator hasn't configured the list and exactly one user
+# exists, treat that user as the instance owner and add their email.
+if [[ "$FITPUB_ADMIN_EMAILS" == "$ADMIN_EMAILS_DEFAULT" ]]; then
+    # to_regclass guard: on the very first boot Flyway hasn't created
+    # the schema yet, so the users table only exists from the second
+    # boot on (i.e. after "Update and reload" or a restart).
+    SOLE_EMAIL=""
+    if [[ "$(as_postgres "$PG_BIN/psql" -d fitpub -tA \
+            -c "SELECT to_regclass('public.users') IS NOT NULL")" == "t" ]]; then
+        SOLE_EMAIL="$(as_postgres "$PG_BIN/psql" -d fitpub -tA \
+            -c "SELECT email FROM users" 2>/dev/null || true)"
+    fi
+    if [[ -n "$SOLE_EMAIL" && "$(wc -l <<< "$SOLE_EMAIL")" -eq 1 ]]; then
+        log "Sole registered user detected; granting admin to $SOLE_EMAIL"
+        export FITPUB_ADMIN_EMAILS="$ADMIN_EMAILS_DEFAULT,$SOLE_EMAIL"
+    fi
+fi
+
 # -----------------------------------------------------------------
 # MailPit — local SMTP sink; UI served under /mailpit via the proxy
 # -----------------------------------------------------------------
 
 log "Starting MailPit (SMTP 127.0.0.1:1025, UI 127.0.0.1:8025)"
-setpriv --reuid=1001 --regid=1001 --clear-groups env HOME=/tmp \
+run_as fitpub env HOME=/tmp \
     /usr/local/bin/mailpit \
     --smtp 127.0.0.1:1025 \
     --listen 127.0.0.1:8025 \
@@ -186,7 +227,7 @@ MAILPIT_PID=$!
 # -----------------------------------------------------------------
 
 log "Starting FitPub on 127.0.0.1:8081 (base URL $FITPUB_BASE_URL)"
-setpriv --reuid=1001 --regid=1001 --clear-groups env \
+run_as fitpub env \
     HOME=/tmp \
     SPRING_PROFILES_ACTIVE=prod \
     SERVER_ADDRESS=127.0.0.1 \
@@ -217,6 +258,7 @@ MAILPIT_UPSTREAM=127.0.0.1:8025 \
 ACTUATOR_USERNAME="$FITPUB_ACTUATOR_USERNAME" \
 ACTUATOR_PASSWORD="$FITPUB_ACTUATOR_PASSWORD" \
 FORWARDED_HOST="$FITPUB_DOMAIN" \
+FORWARDED_PROTO="${FORWARDED_PROTO:-https}" \
     python3 /opt/openhost-fitpub/auth_proxy.py &
 PROXY_PID=$!
 

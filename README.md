@@ -48,15 +48,26 @@ Email never leaves the box — the bundled MailPit catches everything, so
 complete a registration**. That makes signup effectively owner-approved
 despite being "open":
 
-1. Visit `https://fitpub.<zone>/register` and sign up. Use
-   `admin@fitpub.<zone>` if you want the bootstrap admin role once
-   FitPub ships its admin UI (see caveats below); any address works.
+1. Visit `https://fitpub.<zone>/register` and sign up (any address
+   works — mail lands in MailPit regardless).
 2. Open `https://fitpub.<zone>/mailpit` and read the 6-digit
    verification code (codes expire after 15 minutes).
 3. Enter the code to activate the account, then log in.
 
 To invite someone else, have them register, then read the code out of
 MailPit and pass it to them.
+
+### Admin role
+
+FitPub grants admin to accounts whose email is in
+`FITPUB_ADMIN_EMAILS`. The wrapper defaults that to
+`admin@fitpub.<zone>` **plus, when exactly one account exists and no
+override is configured, that account's email** — so on a single-owner
+instance you become admin automatically. The check runs at container
+start, after the schema exists: on a brand-new install, register and
+then restart the app ("Update and reload" or restart from the
+dashboard) to pick up the role. Override the list any time via
+`config.env`.
 
 ## Configuration
 
@@ -98,17 +109,41 @@ Persistent, backed up (`$OPENHOST_APP_DATA_DIR`): `postgres/` (PGDATA),
 `uploads/`, `images/`, `logs/`, `mailpit/`, `secrets.env`,
 `config.env`. Recreatable cache (`$OPENHOST_APP_TEMP_DIR`): `tiles/`.
 
+## Federation notes
+
+The proxy forwards the **original `Host` header verbatim** to FitPub.
+This is load-bearing: ActivityPub HTTP Signatures sign the `host`
+header, and FitPub verifies inbound inbox deliveries against the raw
+request headers. A proxy that rewrites Host to its loopback upstream
+silently breaks all inbound federation — follows report success (the
+outbound leg works) but the remote `Accept` and every workout `Create`
+get 401'd, so nothing ever arrives.
+
+Verified end-to-end with two wrapper instances federating over a
+container network (follow → Accept → workout upload → signed delivery
+→ federated timeline), per FitPub's own
+`docker-compose.federation-test.yml` topology.
+
+`FITPUB_REMOTE_ACTIVITY_BACKFILL` defaults to `true` here (upstream:
+`false`): on startup FitPub re-fetches missing details for remote
+activities it already knows about — a cheap repair after federation
+outages. Note that following someone does **not** import their
+historical workouts; only activities published after the follow are
+delivered.
+
 ## Caveats
 
-* The wrapper tracks `codeberg.org/fitpub/fitpub:latest`. The current
-  release predates two features already on FitPub `main`: the **admin
-  UI** (`/admin` 404s; `FITPUB_ADMIN_EMAILS` is ignored) and the
-  **Basic-auth actuator chain** (`/actuator` redirects to FitPub's
-  login). The proxy already gates both prefixes, so they light up on
-  the next upstream release — "Update and reload" rebuilds against the
-  new image.
+* The wrapper tracks `codeberg.org/fitpub/fitpub:nightly` (daily
+  builds of FitPub `main`), because the 1.1.x release line lacks the
+  admin UI and the Basic-auth actuator chain. Nightly is a moving,
+  pre-release target: "Update and reload" always rebuilds against the
+  newest build, and **Flyway migrations are one-way** — once nightly
+  has migrated the database, rolling back to an older image is not
+  supported. Switch the `FITPUB_IMAGE_LABEL` build arg back to a
+  release label once one ships with those features.
 * `/healthz` prefers the Basic-auth'd `/actuator/health` probe and
-  falls back to fetching the public homepage on the current release.
+  falls back to fetching the public homepage on images that predate
+  the actuator chain.
 * The proxy buffers request bodies (256 MiB cap) and rejects chunked
   transfer encoding; FitPub's default per-file upload limit is 50 MB.
 

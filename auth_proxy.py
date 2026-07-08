@@ -46,6 +46,14 @@ Defense in depth: ALWAYS strip client-supplied ``X-OpenHost-Is-Owner``
 set them (FitPub's prod profile builds absolute URLs from forwarded
 headers).
 
+CRITICAL: the original ``Host`` header is forwarded verbatim (never
+rewritten to the loopback upstream address). ActivityPub HTTP
+Signatures sign the ``host`` header, and FitPub's
+HttpSignatureValidator rebuilds the signing string from the raw
+request headers — a rewritten Host makes every signed inbox delivery
+(Accept, Create, ...) fail verification with 401, which presents as
+"following works but no workouts ever arrive".
+
 Implementation adapted from openhost-vscode/auth_proxy.py.
 """
 
@@ -141,6 +149,7 @@ class GateProxyHandler(BaseHTTPRequestHandler):
     mailpit_port: int = 8025
     actuator_auth: str | None = None  # pre-encoded "Basic ..." value
     forwarded_host: str = ""
+    forwarded_proto: str = "https"
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002, N802
         # Suppress noisy health-probe log lines.
@@ -273,19 +282,29 @@ class GateProxyHandler(BaseHTTPRequestHandler):
     # Forwarded-header hygiene
     # -------------------------------------------------------------
 
+    def _original_host(self) -> str:
+        return self.headers.get("Host", "").strip()
+
     def _forward_headers(
         self, extra: list[tuple[str, str]]
     ) -> list[tuple[str, str]]:
         cleaned = _strip_headers(
             self.headers.items(), HOP_BY_HOP_HEADERS | ALWAYS_STRIP_HEADERS
         )
+        # Re-add the ORIGINAL Host (it is in HOP_BY_HOP_HEADERS so the
+        # generic strip removed it) — HTTP signature verification needs
+        # the exact value the sender signed. _proxy() uses
+        # skip_host=True so http.client won't add a competing one.
+        original_host = self._original_host()
+        if original_host:
+            cleaned.append(("Host", original_host))
         have = {k.lower() for k, _ in cleaned}
         # TLS terminates at OpenHost's edge; make sure FitPub sees the
-        # https scheme + public host even if the router didn't say so.
+        # right scheme + public host even if the router didn't say so.
         if "x-forwarded-proto" not in have:
-            cleaned.append(("X-Forwarded-Proto", "https"))
-        if "x-forwarded-host" not in have and self.forwarded_host:
-            cleaned.append(("X-Forwarded-Host", self.forwarded_host))
+            cleaned.append(("X-Forwarded-Proto", self.forwarded_proto))
+        if "x-forwarded-host" not in have and (original_host or self.forwarded_host):
+            cleaned.append(("X-Forwarded-Host", original_host or self.forwarded_host))
         cleaned.extend(extra)
         return cleaned
 
@@ -307,7 +326,9 @@ class GateProxyHandler(BaseHTTPRequestHandler):
         cleaned = _strip_headers(self.headers.items(), ws_drop)
         cleaned.append(("Connection", "Upgrade"))
         cleaned.append(("Upgrade", "websocket"))
-        forwarded_host = self.headers.get("X-Forwarded-Host", "").strip()
+        original_host = self._original_host() or self.headers.get(
+            "X-Forwarded-Host", ""
+        ).strip()
 
         try:
             upstream_sock = socket.create_connection(
@@ -320,7 +341,7 @@ class GateProxyHandler(BaseHTTPRequestHandler):
 
         try:
             upstream_sock.settimeout(STREAM_TIMEOUT_SECONDS)
-            host_header = forwarded_host or f"{upstream_host}:{upstream_port}"
+            host_header = original_host or f"{upstream_host}:{upstream_port}"
             request_bytes = bytearray()
             request_bytes.extend(
                 self._encode_header_bytes(f"{self.command} {self.path} HTTP/1.1\r\n")
@@ -498,8 +519,10 @@ class GateProxyHandler(BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=120)
         try:
             try:
+                # skip_host: the original Host header travels in
+                # cleaned_headers (signature verification needs it).
                 conn.putrequest(
-                    self.command, self.path, skip_host=False, skip_accept_encoding=True
+                    self.command, self.path, skip_host=True, skip_accept_encoding=True
                 )
                 for key, value in cleaned_headers:
                     conn.putheader(key, value)
@@ -571,6 +594,9 @@ def main() -> int:
     GateProxyHandler.mailpit_host = mailpit_host
     GateProxyHandler.mailpit_port = mailpit_port
     GateProxyHandler.forwarded_host = os.environ.get("FORWARDED_HOST", "").strip()
+    GateProxyHandler.forwarded_proto = (
+        os.environ.get("FORWARDED_PROTO", "https").strip() or "https"
+    )
 
     actuator_user = os.environ.get("ACTUATOR_USERNAME", "").strip()
     actuator_password = os.environ.get("ACTUATOR_PASSWORD", "")

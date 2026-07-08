@@ -1,7 +1,7 @@
 [app]
 name = "fitpub"
-version = "0.1.0"
-description = "FitPub (self-hosted fitness tracking for the Fediverse) packaged for OpenHost. Bundles PostgreSQL/PostGIS and MailPit inside the container; a gate-proxy keeps /admin, /actuator and the MailPit inbox owner-only while leaving the web UI and ActivityPub federation endpoints public."
+version = "0.2.0"
+description = "FitPub (self-hosted fitness tracking for the Fediverse) packaged for OpenHost. Bundles PostgreSQL/PostGIS and MailPit inside the container; a gate-proxy keeps /admin, /actuator and the MailPit inbox owner-only while leaving the web UI and ActivityPub federation endpoints public. Tracks the fitpub:nightly image for the admin UI and actuator auth chain."
 
 [runtime.container]
 image = "Dockerfile"

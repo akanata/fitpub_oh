@@ -4,20 +4,23 @@
 # FitPub's docker-compose splits into services has to live in this
 # single image:
 #
-#   * FitPub itself      — inherited from the upstream release image
-#                          (Ubuntu-based eclipse-temurin JRE, app at
-#                          /app/fitpub.jar, user `fitpub` uid 1001)
-#   * PostgreSQL+PostGIS — from Ubuntu's packages; replaces the
+#   * FitPub itself      — inherited from the upstream image (Alpine,
+#                          app at /app/fitpub.jar, user `fitpub` 1001)
+#   * PostgreSQL+PostGIS — from Alpine's packages; replaces the
 #                          postgis/postgis compose sidecar
 #   * MailPit            — local SMTP sink for registration codes;
 #                          static Go binary from upstream releases
 #   * auth_proxy.py      — hybrid gate: federation + web UI public,
 #                          /admin, /actuator and /mailpit owner-only
 #
-# start.sh supervises the four processes; tini reaps zombies and
-# forwards SIGTERM (same supervision model as openhost-vscode).
-
-FROM codeberg.org/fitpub/fitpub:latest
+# Base image: `nightly` (tracks FitPub main), NOT `latest`. The 1.1.x
+# release line predates the admin UI (/admin, FITPUB_ADMIN_EMAILS) and
+# the Basic-auth actuator chain, both of which this wrapper relies on.
+# Switch back to a release label once one ships with those features.
+# NOTE: Flyway migrations are one-way — once nightly has migrated the
+# database, rolling back to an older image is not supported.
+ARG FITPUB_IMAGE_LABEL=nightly
+FROM codeberg.org/fitpub/fitpub:${FITPUB_IMAGE_LABEL}
 
 # The upstream image drops to USER fitpub (uid 1001); we need root to
 # install packages and to run start.sh, which chowns persistent dirs
@@ -25,17 +28,21 @@ FROM codeberg.org/fitpub/fitpub:latest
 # and mailpit → fitpub).
 USER root
 
-RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends \
+# postgis pulls in the matching postgresql server version; -contrib
+# and -client complete initdb/psql. su-exec is the privilege-drop
+# helper (Alpine's gosu); bash is required by start.sh.
+RUN apk add --no-cache \
+        bash \
+        postgis \
         postgresql \
-        postgresql-postgis \
+        postgresql-contrib \
         python3 \
         tini \
         curl \
-        ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+        su-exec \
+        ca-certificates
 
-# MailPit is a single static binary; Ubuntu doesn't package it.
+# MailPit is a single static binary; Alpine doesn't package it.
 # Pinned version — bump deliberately.
 ARG MAILPIT_VERSION=v1.30.3
 RUN curl -fsSL "https://github.com/axllent/mailpit/releases/download/${MAILPIT_VERSION}/mailpit-linux-amd64.tar.gz" \
@@ -49,4 +56,4 @@ COPY --chmod=644 auth_proxy.py /opt/openhost-fitpub/auth_proxy.py
 # (5432) and MailPit (1025/8025) stay loopback-only.
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/opt/openhost-fitpub/start.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "/opt/openhost-fitpub/start.sh"]
