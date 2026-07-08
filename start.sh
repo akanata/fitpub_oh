@@ -149,6 +149,14 @@ if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
         --locale=C.UTF-8 \
         --auth-local=trust \
         --auth-host=scram-sha-256
+elif [[ "$(stat -c %u "$PGDATA")" != "$(id -u postgres)" ]]; then
+    # The postgres uid differs between base images (Ubuntu ~10x,
+    # Alpine 70). A cluster initialized under one base is unreadable
+    # to the other's postgres user, so reconcile ownership whenever
+    # the image lineage changes.
+    log "PGDATA owned by uid $(stat -c %u "$PGDATA"); re-owning for postgres ($(id -u postgres))"
+    chown -R postgres:postgres "$PGDATA"
+    chmod 700 "$PGDATA"
 fi
 
 log "Starting PostgreSQL"
@@ -187,6 +195,10 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'fitpub') \gexec
 EOF
 as_postgres "$PG_BIN/psql" -v ON_ERROR_STOP=1 -q -d fitpub \
     -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+# Base-image switches can carry a newer PostGIS than the one the
+# extension was created with; upgrade in place (no-op when current).
+as_postgres "$PG_BIN/psql" -q -d fitpub \
+    -c "ALTER EXTENSION postgis UPDATE;" 2>/dev/null || true
 
 # Single-owner admin bootstrap: FitPub grants the admin role to
 # accounts whose email is listed in FITPUB_ADMIN_EMAILS. The zone
